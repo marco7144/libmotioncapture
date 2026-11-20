@@ -294,7 +294,10 @@ namespace libmotioncapture {
   MotionCaptureOptitrack::MotionCaptureOptitrack(
     const std::string &hostname,
     const std::string& interface_ip,
-    int port_command)
+    int port_command,
+    int legacy_data_port,
+    bool legacy_multicast,
+    const std::string& legacy_multicast_address)
   {
     pImpl = new MotionCaptureOptitrackImpl;
 
@@ -326,7 +329,10 @@ namespace libmotioncapture {
     sRequest connectCmd = {NAT_CONNECT, 0};
     socket_cmd.send_to(boost::asio::buffer(&connectCmd, sizeof(connectCmd)), endpoint_cmd);
 
-    sResponse response;
+    // Older NatNet servers (including the NatNet 2.x versions used by Motive
+    // 1.x) only return the common sender fields. Zero-init the rest because
+    // clock/data-port/multicast fields were added in NatNet 3.0.
+    sResponse response{};
     udp::endpoint sender_endpoint;
     size_t reply_length = socket_cmd.receive_from(
         boost::asio::buffer(&response, sizeof(response)), sender_endpoint);
@@ -344,9 +350,28 @@ namespace libmotioncapture {
 
     pImpl->versionMajor = response.NatNetVersion[0];
     pImpl->versionMinor = response.NatNetVersion[1];
-    memcpy(&pImpl->clockFrequency, response.HighResClockFrequency, sizeof(uint64_t));
-
     uint16_t port_data = response.DataPort;
+    bool is_multicast = response.IsMulticast;
+    uint8_t multicast_group[4];
+    memcpy(multicast_group, response.MulticastGroupAddress, sizeof(multicast_group));
+
+    std::string multicast_address;
+    if (pImpl->versionMajor < 3) {
+      // NatNet 2.x does not include these connection settings in NAT_SERVERINFO,
+      // so use the legacy transport settings supplied by the application.
+      pImpl->clockFrequency = 0;
+      port_data = legacy_data_port;
+      is_multicast = legacy_multicast;
+      multicast_address = legacy_multicast_address;
+    } else {
+      memcpy(&pImpl->clockFrequency, response.HighResClockFrequency, sizeof(uint64_t));
+      std::ostringstream sstr;
+      sstr << (int)multicast_group[0] << "."
+           << (int)multicast_group[1] << "."
+           << (int)multicast_group[2] << "."
+           << (int)multicast_group[3];
+      multicast_address = sstr.str();
+    }
 
     // query model def
     sRequest modelDefCmd = {NAT_REQUEST_MODELDEF, 0};
@@ -360,6 +385,13 @@ namespace libmotioncapture {
     // connect to data port to receive mocap data
     auto listen_address_boost = boost::asio::ip::make_address_v4(interface_ip);
 
+    if (!is_multicast && pImpl->versionMajor < 3) {
+      // NatNet 2.x Unicast servers stream frames back to the client source port
+      // that sent NAT_CONNECT (the ephemeral port of socket_cmd).
+      port_data = socket_cmd.local_endpoint().port();
+      socket_cmd.close();
+    }
+
     // Create the socket so that multiple may be bound to the same address.
     boost::asio::ip::udp::endpoint listen_endpoint(
         boost::asio::ip::address_v4::any(), port_data);
@@ -367,20 +399,20 @@ namespace libmotioncapture {
     pImpl->socket.set_option(boost::asio::ip::udp::socket::reuse_address(true));
     pImpl->socket.bind(listen_endpoint);
 
-    if (response.IsMulticast) {
-      std::stringstream sstr;
-      sstr << (int)response.MulticastGroupAddress[0] << "."
-           << (int)response.MulticastGroupAddress[1] << "."
-           << (int)response.MulticastGroupAddress[2] << "."
-           << (int)response.MulticastGroupAddress[3];
-      std::string multicast_address = sstr.str();
+    if (is_multicast) {
       auto multicast_address_boost = boost::asio::ip::make_address_v4(multicast_address);
       // Join the multicast group on a specific interface
       pImpl->socket.set_option(boost::asio::ip::multicast::join_group(multicast_address_boost, listen_address_boost));
+      std::cout << "[OptiTrack] NatNet " << pImpl->version
+                << " (RBdefs=" << pImpl->rigidBodyDefinitions.size() << "): "
+                << "Multicast " << multicast_address << ":" << port_data
+                << " on interface " << interface_ip << std::endl;
     } else {
       // log some server info
       std::ostringstream ustr;
-      ustr << "Using unicast from server " << hostname << ":" << port_data;
+      ustr << "[OptiTrack] NatNet " << pImpl->version
+           << " (RBdefs=" << pImpl->rigidBodyDefinitions.size() << "): "
+           << "Using unicast from server " << hostname << " on local port " << port_data;
       std::cout << ustr.str() << std::endl;
     }
   }
@@ -463,6 +495,19 @@ namespace libmotioncapture {
           memcpy(&pImpl->rigidBodies[j].qy, ptr, 4); ptr += 4;
           memcpy(&pImpl->rigidBodies[j].qz, ptr, 4); ptr += 4;
           memcpy(&pImpl->rigidBodies[j].qw, ptr, 4); ptr += 4;
+
+          // NatNet < 3.0 includes per-rigid-body marker data before mean error
+          // (removed in NatNet 3.0+; see official NatNet SDK PacketClient.cpp)
+          if (major < 3)
+          {
+            int nRigidMarkers = 0; memcpy(&nRigidMarkers, ptr, 4); ptr += 4;
+            ptr += nRigidMarkers * 3 * sizeof(float); // marker positions
+            if (major >= 2)
+            {
+              ptr += nRigidMarkers * sizeof(int);     // marker IDs
+              ptr += nRigidMarkers * sizeof(float);   // marker sizes
+            }
+          }
 
           // NatNet version 2.0 and later
           if(major >= 2)

@@ -171,7 +171,10 @@ namespace libmotioncapture {
       mocap = new libmotioncapture::MotionCaptureOptitrack(
         getString(cfg, "hostname", "localhost"),
         getString(cfg, "interface_ip", "0.0.0.0"),
-        getInt(cfg, "port_command", 1510));
+        getInt(cfg, "port_command", 1510),
+        getInt(cfg, "legacy_data_port", 1511),
+        getBool(cfg, "legacy_multicast", true),
+        getString(cfg, "legacy_multicast_address", "239.255.42.99"));
     }
 #endif
 #ifdef ENABLE_OPTITRACK_CLOSED_SOURCE
