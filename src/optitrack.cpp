@@ -790,21 +790,26 @@ namespace libmotioncapture {
   {
     // TODO: avoid copies here...
     rigidBodies_.clear();
+    // Motive 1.x (NatNet < 3.0) always streams right-handed Y-Up;
+    // ROS 2 / Crazyswarm2 require right-handed Z-Up (REP-103).
+    // Apply +90 deg rotation around X: (x, y, z) -> (x, -z, y).
+    const bool convertYUpToZUp = (pImpl->versionMajor > 0 && pImpl->versionMajor < 3);
     for (const auto& rb : pImpl->rigidBodies) {
       if (rb.bTrackingValid) {
         const auto& def = pImpl->rigidBodyDefinitions[rb.ID];
 
-        Eigen::Vector3f position(
-          rb.x + def.xoffset,
-          rb.y + def.yoffset,
-          rb.z + def.zoffset);
+        const float x = rb.x + def.xoffset;
+        const float y = rb.y + def.yoffset;
+        const float z = rb.z + def.zoffset;
 
-        Eigen::Quaternionf rotation(
-          rb.qw, // w
-          rb.qx, // x
-          rb.qy, // y
-          rb.qz  // z
-          );
+        Eigen::Vector3f position = convertYUpToZUp
+          ? Eigen::Vector3f(x, -z, y)
+          : Eigen::Vector3f(x, y, z);
+
+        Eigen::Quaternionf rotation = convertYUpToZUp
+          ? Eigen::Quaternionf(rb.qw, rb.qx, -rb.qz, rb.qy)
+          : Eigen::Quaternionf(rb.qw, rb.qx, rb.qy, rb.qz);
+
         rigidBodies_.emplace(def.name, RigidBody(def.name, position, rotation));
       }
     }
@@ -814,10 +819,15 @@ namespace libmotioncapture {
   const PointCloud& MotionCaptureOptitrack::pointCloud() const
   {
     // TODO: avoid copies here...
+    const bool convertYUpToZUp = (pImpl->versionMajor > 0 && pImpl->versionMajor < 3);
     pointcloud_.resize(pImpl->markers.size(), Eigen::NoChange);
     for (size_t r = 0; r < pImpl->markers.size(); ++r) {
       const auto& marker = pImpl->markers[r];
-      pointcloud_.row(r) << marker.x, marker.y, marker.z;
+      if (convertYUpToZUp) {
+        pointcloud_.row(r) << marker.x, -marker.z, marker.y;
+      } else {
+        pointcloud_.row(r) << marker.x, marker.y, marker.z;
+      }
     }
     return pointcloud_;
   }
